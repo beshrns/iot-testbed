@@ -38,6 +38,7 @@ metadata = None
 post_processing = None
 is_nested = False
 force_reboot = False
+forward_serial = False
 
 MAX_START_ATTEMPTS = 3
 TESTBED_PATH = "/usr/testbed"
@@ -46,6 +47,8 @@ LOCK_PATH = os.path.join(TESTBED_PATH, "lock")
 CURR_JOB_PATH = os.path.join(TESTBED_PATH, "curr_job")
 HOME = os.path.expanduser("~")
 USER = getpass.getuser()
+next_job_path = os.path.join(TESTBED_PATH, "next_job")
+next_job_path_user = os.path.join(TESTBED_PATH, "next_job_%s" %(USER))
 
 def lock_is_taken():
     return os.path.exists(LOCK_PATH)
@@ -70,9 +73,9 @@ def file_set_permissions(path):
   if path.startswith(TESTBED_PATH) and not os.path.exists(path):
     file = open(path, "w")
     file.close()
-    #uid = pwd.getpwnam(USER).pw_uid
-    #gid = grp.getgrnam("testbed").gr_gid
-    #os.chown(path, uid, gid)
+    uid = pwd.getpwnam(USER).pw_uid
+    gid = grp.getgrnam("testbed").gr_gid
+    os.chown(path, uid, gid)
     if os.path.abspath(path) == CURR_JOB_PATH:
       # the file 'curr_job' is only writeable by us
       os.chmod(path, 0640)
@@ -191,20 +194,31 @@ def create(name, platform, hosts, copy_from, do_start, duration, metadata, post_
     if copy_from != None and os.path.isfile(os.path.join(copy_from, "duration")):
       duration = file_read(os.path.join(copy_from, "duration"))
 
-  # read next job ID from 'next_job' file
-  next_job_path = os.path.join(TESTBED_PATH, "next_job")
-  if not os.path.exists(next_job_path):
-    job_id = 0
+  # read and update next job ID from max 'next_job' 'next_job?user' files
+  if os.path.exists(next_job_path_user):
+    job_id_user = int(file_read(next_job_path_user))
   else:
-    job_id = int(file_read(next_job_path))
+    job_id_user = 0
+    file_write(next_job_path_user, "%u\n"%(job_id_user))
+
+  if os.path.exists(next_job_path):
+    job_id= int(file_read(next_job_path))
+  else:
+    job_id = job_id_user
+    file_write(next_job_path, "%u\n"%(job_id))
+
+  job_id_user = max(job_id, job_id_user)
+  #file_write(next_job_path, "%u\n"%(job_id))
+  file_write(next_job_path_user, "%u\n"%(job_id_user))
+
   # check if job id is already used
-  job_dir = get_job_directory(job_id)
+  job_dir = get_job_directory(job_id_user)
   if job_dir != None:
-    print "Job %d already exists! Delete %s before creating a new job." %(job_id, job_dir)
+    print "Job %d already exists! Delete %s before creating a new job." %(job_id_user, job_dir)
     do_quit(1)
 
   # create user job directory
-  job_dir = os.path.join(HOME, "jobs", "%u_%s" %(job_id, name))
+  job_dir = os.path.join(HOME, "jobs", "%u_%s" %(job_id_user, name))
   # initialize job directory from copy_from command line parameter
   if copy_from != None:
     if os.path.isdir(copy_from):
@@ -231,16 +245,15 @@ def create(name, platform, hosts, copy_from, do_start, duration, metadata, post_
   if duration != None:
     # create duration file in job directory
     file_write(os.path.join(job_dir, "duration"), duration + "\n")
-  # success: update next_job file
-  file_write(next_job_path, "%u\n"%(job_id+1))
   # write creation timestamp
   ts = timestamp()
   file_write(os.path.join(job_dir, ".created"), ts + "\n")  # write history
-  history_message = "%s: %s created job %u, platform:%s, hosts:%s, copy-from:%s, directory:%s" %(ts, USER, job_id, platform, hosts, copy_from, job_dir)
+  history_message = "%s: %s created job %u, platform:%s, hosts:%s, copy-from:%s, directory:%s" %(ts, USER, job_id_user, platform, hosts, copy_from, job_dir)
   file_append(os.path.join(TESTBED_PATH, "history"), history_message + "\n")
   print history_message
   if do_start:
-    start(job_id)
+    start(job_id_user)
+  file_write(next_job_path_user, "%u\n"%(job_id_user+1))
 
 def status():
   load_curr_job_variables(False, False)
@@ -327,7 +340,7 @@ def start(job_id):
     if pssh(hosts_path, "prepare.sh %s"%(os.path.basename(job_dir)), "Preparing the PI nodes", merge_path=True) == 0:
       # run platform start script
       start_script_path = os.path.join(TESTBED_SCRIPTS_PATH, platform, "start.py")
-      if os.path.exists(start_script_path) and subprocess.call([start_script_path, job_dir]) == 0:
+      if os.path.exists(start_script_path) and subprocess.call([start_script_path, job_dir, "forward" if forward_serial else ""]) == 0:
         started = True
       else:
         print "Platform start script %s failed"%(start_script_path)
@@ -360,6 +373,8 @@ def start(job_id):
     py_testbed_script_path = os.path.join(TESTBED_SCRIPTS_PATH, "testbed.py")
     os.system("echo '%s stop --force --start-next'  | at now + %u min" %(py_testbed_script_path, duration + 1))
   print history_message
+  # success, set next job id
+  file_write(next_job_path, "%u\n"%(job_id+1))
 
 def rsync(src, dst):
   print "rsync -avz %s %s" %(src, dst)
@@ -452,6 +467,7 @@ def reboot():
     print history_message
     time.sleep(d) # wait 60s to give time for reboot
   else:
+    ts = timestamp()
     history_message = "%s: %s has disabled reboot, but there was a problem beforehand" %(ts, USER)
     file_append(os.path.join(TESTBED_PATH, "history"), history_message + "\n")
     print history_message
@@ -481,6 +497,8 @@ def usage():
   print "--metadata         'copy any metadata file to job directory'"
   print "--post-processing  'call a given post-processing script at the end of the run'"
   print "--nested           'set this if calling from a script that already took the lock'"
+  print "--with-reboot      'reboot the raspberry PIs if the job creation fails'"
+  print "--forward-serial   'Forwards the serial line data into a TCP socket (tcp://raspi:50000)'"
   print
   print "Usage of start:"
   print "$testbed.py start [--job-id ID]"
@@ -508,7 +526,7 @@ if __name__=="__main__":
     sys.exit(1)
 
   try:
-    opts, args = getopt.getopt(sys.argv[2:], "", ["name=", "platform=", "hosts=", "copy-from=", "duration=", "job-id=", "start", "force", "no-download", "start-next", "metadata=", "post-processing=", "nested"])
+    opts, args = getopt.getopt(sys.argv[2:], "", ["name=", "platform=", "hosts=", "copy-from=", "duration=", "job-id=", "start", "force", "no-download", "start-next", "metadata=", "post-processing=", "nested", "with-reboot", "forward-serial"])
   except getopt.GetoptError:
     usage()
 
@@ -543,6 +561,8 @@ if __name__=="__main__":
        is_nested = True
    elif opt == "--with-reboot":
        force_reboot = True
+   elif opt == "--forward-serial":
+       forward_serial = True
 
   if not is_nested and lock_is_taken():
       print "Lock is taken. Try a gain in a few seconds/minutes."
